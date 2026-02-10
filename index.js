@@ -21,6 +21,81 @@ function errorResponse(res, status, message) {
   });
 }
 
+function extractGeminiError(err) {
+  const status = err?.response?.status;
+  const apiMessage =
+    err?.response?.data?.error?.message ||
+    err?.response?.data?.message ||
+    err?.message ||
+    "Unknown error";
+  return { status, apiMessage, raw: err?.response?.data };
+}
+
+async function geminiGenerateOneWordAnswer(question) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    const e = new Error("GEMINI_API_KEY is missing");
+    e.code = "MISSING_GEMINI_API_KEY";
+    throw e;
+  }
+
+  // Try newer/common models first; fallback for accounts that don’t have access to some models.
+  const modelsToTry = [
+    process.env.GEMINI_MODEL,
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash"
+  ].filter(Boolean);
+
+  let lastErr;
+  for (const model of modelsToTry) {
+    try {
+      const aiRes = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        {
+          contents: [
+            {
+              parts: [
+                {
+                  text: `Answer the following question in EXACTLY ONE WORD.
+Do not add punctuation.
+Do not add explanation.
+If unsure, still respond with one word only.
+
+Question: ${question}`
+                }
+              ]
+            }
+          ]
+        },
+        {
+          params: { key: apiKey },
+          timeout: 20000
+        }
+      );
+
+      const raw =
+        aiRes.data.candidates?.[0]?.content?.parts?.[0]?.text || "Unknown";
+
+      const cleaned = raw
+        .trim()
+        .replace(/[^A-Za-z0-9]/g, "")
+        .split(/\s+/)[0];
+
+      return cleaned || "Unknown";
+    } catch (err) {
+      lastErr = err;
+      // Keep trying on model-not-found or permission errors; otherwise it’s likely request/key/quota.
+      const { status } = extractGeminiError(err);
+      if (![400, 401, 403, 404, 429].includes(status)) {
+        throw err;
+      }
+    }
+  }
+
+  throw lastErr || new Error("Gemini request failed");
+}
+
 
 
 
@@ -136,45 +211,26 @@ app.post("/bfhl", async (req, res) => {
 
 
 
-                        case "AI":
-                        if (typeof value !== "string" || value.trim() === "") {
-                            return errorResponse(res, 400, "AI input must be a string");
-                        }
-
-
-
-
-
-  const aiRes = await axios.post(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${process.env.GEMINI_API_KEY}`,
-    {
-      contents: [
-        {
-          parts: [
-            {
-              text: `Answer the following question in EXACTLY ONE WORD.
-Do not add punctuation.
-Do not add explanation.
-If unsure, still respond with one word only.
-
-Question: ${value}`
-            }
-          ]
+      case "AI":
+        if (typeof value !== "string" || value.trim() === "") {
+          return errorResponse(res, 400, "AI input must be a string");
         }
-      ]
-    }
-  );
 
-  let raw =
-    aiRes.data.candidates?.[0]?.content?.parts?.[0]?.text || "Unknown";
+        try {
+          data = await geminiGenerateOneWordAnswer(value);
+        } catch (err) {
+          const { status, apiMessage, raw } = extractGeminiError(err);
+          console.log("Gemini call failed:", { status, apiMessage });
+          if (raw) console.log("Gemini error response:", JSON.stringify(raw, null, 2));
+          // Return actionable error so Postman shows exactly what to fix (key/quota/model/etc).
+          return errorResponse(
+            res,
+            502,
+            `AI service failed${status ? ` (${status})` : ""}: ${apiMessage}`
+          );
+        }
 
-  // Hard sanitize (final safety net)
-  data = raw
-    .trim()
-    .replace(/[^A-Za-z0-9]/g, "")   
-    .split(/\s+/)[0];              
-
-  break;
+        break;
 
 
       default:
@@ -192,7 +248,10 @@ Question: ${value}`
 
 
   } catch (err) {
-    console.log("Requeset not processing..error:  ", err.message);
+    console.log("Request not processing.. error: ", err.message);
+    if (err.response?.data) {
+      console.log("Gemini error response:", JSON.stringify(err.response.data, null, 2));
+    }
     return errorResponse(res, 500, "There is problem in server");
   }
 });
